@@ -10,11 +10,16 @@
 //|           - Displacement filter (FVG-creating impulse).          |
 //|           - Entry anchor selectable: Legacy EMA / FVG-fill / OTE. |
 //|         Legacy behaviour is fully preserved via EntryMode.       |
+//|  v4.03  STOP MANAGEMENT REWORK:                                  |
+//|           - Break-even locks a positive cushion (in R), never    |
+//|             exact entry, and is floored above spread+commission.  |
+//|           - Optional ATR trailing after activation so the runner  |
+//|             captures trend instead of scratching at break-even.   |
 //+------------------------------------------------------------------+
 #property copyright "Mustafa_FX"
 #property link      ""
-#property version   "4.02"
-#property description "Mustafa_FX Retest Strategy - Bias Aligned + SMC structure module"
+#property version   "4.03"
+#property description "Mustafa_FX Retest Strategy - Bias Aligned + SMC structure + trailing"
 
 #include <Trade\Trade.mqh>
 
@@ -41,6 +46,12 @@ input bool            RequireDisplacement   = true;      // Require FVG-creating
 input double          DisplacementBodyAtr   = 1.0;       // Min displacement candle body / ATR
 input double          OteLevel              = 0.705;     // OTE retrace level (0.62-0.79 band, 0.705 = sweet spot)
 
+//--- Stop Management (v4.03) --------------------------------------
+input double          BE_Lock_R             = 0.15;      // Profit locked at break-even, in R (0 = exact entry, not advised)
+input double          BE_Cost_Buffer_Points = 0;         // Extra points beyond spread to cover commission
+input bool            UseTrailing           = true;      // ATR-trail the stop after activation
+input double          Trail_Atr_Mult        = 1.5;       // Trailing distance (ATR multiples)
+
 //--- Master Bias & Trend Inputs
 input int             BiasEmaLen            = 200;       // Master Trend Bias EMA
 input int             FastEmaLen            = 34;        // Fast Trend EMA
@@ -65,6 +76,7 @@ ulong          Magic_TP1, Magic_TP2;
 
 //--- Cached symbol constraints (refreshed each new bar)
 double         g_volStep, g_minVol, g_maxVol, g_tickSize, g_stopsLevel;
+double         g_atr = 0;   // last computed ATR, used by the trailing stop
 
 //--- Structs ------------------------------------------------------
 struct FvgInfo
@@ -239,49 +251,92 @@ void ManagePendingOrders(bool bullBias, bool bearBias)
 }
 
 //+------------------------------------------------------------------+
-//| Manage Break-Even Logic (Runs every tick)                        |
+//| Manage Stops: break-even-with-lock + ATR trail (runs every tick) |
+//|  - Stage 1: at BE_Activation_Percent of the TP1 distance, move   |
+//|    SL to entry + a positive cushion, floored above spread/costs. |
+//|  - Stage 2: once activated, trail by Trail_Atr_Mult * ATR.       |
+//|  Both legs use the TP1-equivalent distance so they advance       |
+//|  together. The stop is monotonic (only ever tightens).           |
 //+------------------------------------------------------------------+
-void ManageBreakEven()
+void ManageTradeStops()
 {
-    double minStopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+    double minStopLevel = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+    double bid   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double ask   = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double spread = ask - bid;
+    double atr   = g_atr;
+    double costFloor = spread + (BE_Cost_Buffer_Points * _Point);
+
+    if(TP1_RewardRatio <= 0) return;
+
     for(int i = PositionsTotal() - 1; i >= 0; i--)
     {
         ulong ticket = PositionGetTicket(i);
         if(ticket == 0) continue;
         ulong m = PositionGetInteger(POSITION_MAGIC);
+        if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+        if(m != Magic_TP1 && m != Magic_TP2) continue;
 
-        if(PositionGetString(POSITION_SYMBOL) == _Symbol && (m == Magic_TP1 || m == Magic_TP2))
+        double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+        double sl    = PositionGetDouble(POSITION_SL);
+        double tp    = PositionGetDouble(POSITION_TP);
+        long   type  = PositionGetInteger(POSITION_TYPE);
+        if(tp == 0 || sl == 0) continue;
+
+        double fullTpDistance = MathAbs(tp - entry);
+        if(fullTpDistance <= 0) continue;
+
+        // TP1-equivalent price distance, so both legs activate together
+        double tp1Distance = fullTpDistance;
+        if(m == Magic_TP2 && TP2_RewardRatio > 0)
+            tp1Distance = (fullTpDistance / TP2_RewardRatio) * TP1_RewardRatio;
+
+        double riskR         = tp1Distance / TP1_RewardRatio;          // 1R in price terms
+        double activationDist = tp1Distance * (BE_Activation_Percent / 100.0);
+        double lockCushion    = MathMax(BE_Lock_R * riskR, costFloor); // never exact entry, never inside costs
+
+        double newSL = sl;
+
+        if(type == POSITION_TYPE_BUY)
         {
-            double entry = PositionGetDouble(POSITION_PRICE_OPEN);
-            double sl    = PositionGetDouble(POSITION_SL);
-            double tp    = PositionGetDouble(POSITION_TP);
-            long   type  = PositionGetInteger(POSITION_TYPE);
-
-            if(tp == 0) continue;
-            double fullTpDistance = MathAbs(tp - entry);
-            if(fullTpDistance == 0) continue;
-
-            double targetDistance = fullTpDistance;
-            if(m == Magic_TP2 && TP2_RewardRatio > 0)
-                targetDistance = (fullTpDistance / TP2_RewardRatio) * TP1_RewardRatio;
-
-            double activationDist = targetDistance * (BE_Activation_Percent / 100.0);
-
-            if(type == POSITION_TYPE_BUY)
+            double profit = bid - entry;
+            if(profit >= activationDist)
             {
-                double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-                if(currentBid >= (entry + activationDist) && sl < entry)
-                    if(entry - currentBid < -minStopLevel)
-                        if(!trade.PositionModify(ticket, NormalizePrice(entry), tp))
-                            PrintFormat("BE modify failed #%I64u, retcode=%u", ticket, trade.ResultRetcode());
+                double beStop = entry + lockCushion;            // Stage 1: locked break-even
+                if(beStop > newSL) newSL = beStop;
+                if(UseTrailing && atr > 0)
+                {
+                    double trailStop = bid - (Trail_Atr_Mult * atr);  // Stage 2: ATR trail
+                    if(trailStop > newSL) newSL = trailStop;
+                }
             }
-            else if(type == POSITION_TYPE_SELL)
+            if(newSL > sl)
             {
-                double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-                if(currentAsk <= (entry - activationDist) && (sl > entry || sl == 0))
-                    if(currentAsk - entry < -minStopLevel)
-                        if(!trade.PositionModify(ticket, NormalizePrice(entry), tp))
-                            PrintFormat("BE modify failed #%I64u, retcode=%u", ticket, trade.ResultRetcode());
+                newSL = NormalizePrice(newSL);
+                if(newSL < bid - minStopLevel && newSL < tp && newSL > sl)
+                    if(!trade.PositionModify(ticket, newSL, tp))
+                        PrintFormat("Stop modify failed (BUY) #%I64u, retcode=%u", ticket, trade.ResultRetcode());
+            }
+        }
+        else if(type == POSITION_TYPE_SELL)
+        {
+            double profit = entry - ask;
+            if(profit >= activationDist)
+            {
+                double beStop = entry - lockCushion;            // Stage 1
+                if(beStop < newSL) newSL = beStop;
+                if(UseTrailing && atr > 0)
+                {
+                    double trailStop = ask + (Trail_Atr_Mult * atr);  // Stage 2
+                    if(trailStop < newSL) newSL = trailStop;
+                }
+            }
+            if(newSL < sl)
+            {
+                newSL = NormalizePrice(newSL);
+                if(newSL > ask + minStopLevel && newSL > tp && newSL < sl)
+                    if(!trade.PositionModify(ticket, newSL, tp))
+                        PrintFormat("Stop modify failed (SELL) #%I64u, retcode=%u", ticket, trade.ResultRetcode());
             }
         }
     }
@@ -464,7 +519,7 @@ bool PlaceTwoLegSetup(bool isBuy, double legLot, double price, double sl, double
 //+------------------------------------------------------------------+
 void OnTick()
 {
-    ManageBreakEven();
+    ManageTradeStops();
 
     datetime currentBarTime = (datetime)SeriesInfoInteger(_Symbol, _Period, SERIES_LASTBAR_DATE);
     if(currentBarTime == lastBarTime) return;
@@ -497,6 +552,7 @@ void OnTick()
     if(CopyOpen (_Symbol, _Period, 1, ohlcDepth, open)  < ohlcDepth) return;
 
     double atr = atrArr[0];
+    g_atr = atr;   // cache for the trailing stop manager
 
     // --- BIAS & TREND ---
     bool bullBias  = (close[0] > biasEma[0]);

@@ -173,4 +173,4 @@ Check the journal for a `CRT armed …` line for that candle:
 
 ## License
 
-Add your chosen license here (e.g. MIT). Until then, all rights reserved by the author.
+all rights reserved by the author @jeyMustafa_fx.
